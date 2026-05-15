@@ -9,12 +9,15 @@ use librespot_playback::{
 use symphonia_core::io::MediaSource;
 
 /// `DiscordSink` is handed to the librespot `Player` as the audio output.
-/// On every decoded audio packet it converts f64 PCM → f32 LE bytes and
-/// pushes them into a crossbeam channel that `PcmReader` reads from.
 ///
-/// When librespot stops a track (before loading the next one) it calls `stop()`,
-/// which sends a flush signal so `PcmReader` discards any stale buffered audio
-/// from the old track immediately.
+/// On every decoded audio packet it converts f64 PCM → f32 LE bytes and
+/// pushes them into a bounded crossbeam channel.  The bounded capacity
+/// (~1.3 s of audio) back-pressures librespot's decode thread to real-time
+/// speed so Spotify doesn't jump to the next track prematurely.
+///
+/// When librespot stops a track it calls `stop()`, which sends a flush
+/// signal so `PcmReader` immediately discards any stale buffered audio from
+/// the old track.
 pub struct DiscordSink {
     sender: Sender<Vec<u8>>,
     flush_tx: Sender<()>,
@@ -32,8 +35,8 @@ impl Sink for DiscordSink {
     }
 
     fn stop(&mut self) -> SinkResult<()> {
-        // Signal PcmReader to discard any buffered audio from the track that
-        // just ended so the next track starts cleanly.
+        // Signal PcmReader to discard buffered audio from the ending track
+        // so the next track starts cleanly without replaying stale samples.
         let _ = self.flush_tx.try_send(());
         Ok(())
     }
@@ -45,12 +48,10 @@ impl Sink for DiscordSink {
             Err(_) => return Ok(()),
         };
 
-        // f64 normalized → f32 normalized (range −1.0..=1.0), then to LE bytes
+        // f64 normalised → f32 normalised (−1.0..=1.0), then to LE bytes.
+        // The SoftMixer already applied volume scaling before this point.
         let f32_samples = converter.f64_to_f32(samples);
-        let bytes: Vec<u8> = f32_samples
-            .iter()
-            .flat_map(|s| s.to_le_bytes())
-            .collect();
+        let bytes: Vec<u8> = f32_samples.iter().flat_map(|s| s.to_le_bytes()).collect();
 
         self.sender
             .send(bytes)
@@ -62,6 +63,10 @@ impl Sink for DiscordSink {
 
 /// Implements `Read + Seek + MediaSource` so it can be wrapped in
 /// `RawAdapter::new(reader, 44_100, 2)` → `Input` for songbird.
+///
+/// Audio is passed through with zero processing — the Spotify client
+/// controls everything (volume, crossfade, normalization) via the
+/// SoftMixer/Spirc pipeline.
 pub struct PcmReader {
     receiver: Receiver<Vec<u8>>,
     flush_rx: Receiver<()>,
@@ -71,19 +76,14 @@ pub struct PcmReader {
 
 impl PcmReader {
     pub fn new(receiver: Receiver<Vec<u8>>, flush_rx: Receiver<()>) -> Self {
-        PcmReader {
-            receiver,
-            flush_rx,
-            buf: Vec::new(),
-            pos: 0,
-        }
+        PcmReader { receiver, flush_rx, buf: Vec::new(), pos: 0 }
     }
 }
 
 impl Read for PcmReader {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-        // If the sink signaled a track change, discard all buffered audio so
-        // the new track starts immediately without replaying stale samples.
+        // Track transition: discard stale audio so the new track starts
+        // immediately without replaying the tail of the previous one.
         if self.flush_rx.try_recv().is_ok() {
             while self.receiver.try_recv().is_ok() {}
             self.buf.clear();
@@ -93,7 +93,6 @@ impl Read for PcmReader {
         }
 
         loop {
-            // Drain the current buffer first
             if self.pos < self.buf.len() {
                 let available = self.buf.len() - self.pos;
                 let to_copy = available.min(out.len());
@@ -101,19 +100,19 @@ impl Read for PcmReader {
                 self.pos += to_copy;
                 return Ok(to_copy);
             }
-            // Buffer exhausted — try to get more audio data
+
             match self.receiver.try_recv() {
                 Ok(chunk) => {
                     self.buf = chunk;
                     self.pos = 0;
                 }
-                // No audio yet (Spotify still loading) — output silence so the
-                // track stays alive in the mixer while we wait for librespot
+                // No audio yet (Spotify still loading) — output silence so
+                // the track stays alive in the mixer while we wait.
                 Err(TryRecvError::Empty) => {
                     out.fill(0);
                     return Ok(out.len());
                 }
-                // Channel closed (librespot shut down) → signal EOF to songbird
+                // Channel closed (librespot shut down) → signal EOF to songbird.
                 Err(TryRecvError::Disconnected) => return Ok(0),
             }
         }
@@ -122,7 +121,6 @@ impl Read for PcmReader {
 
 impl Seek for PcmReader {
     fn seek(&mut self, _pos: SeekFrom) -> io::Result<u64> {
-        // Live PCM stream — seeking is not supported
         Err(io::Error::new(io::ErrorKind::Unsupported, "PcmReader is not seekable"))
     }
 }

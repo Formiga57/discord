@@ -19,4 +19,4 @@ services:
       # HOST_PORT:3000 — change the left side to match your reverse-proxy config.
       # SPOTIFY_REDIRECT_URI in .env must point to the public URL that forwards
       # here, e.g. https://yourhost.example.com/auth/callback
-      - "3000:3000"
+      - "3002:3000"

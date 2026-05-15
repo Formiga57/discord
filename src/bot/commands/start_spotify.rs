@@ -16,11 +16,11 @@ use crate::{
         auth::{build_auth_url, get_spotify_user},
         connect::create_connect_device,
     },
-    store::Store,
+    store::{ActiveSession, Store},
 };
 
 pub async fn run(ctx: &Context, command: &CommandInteraction, cfg: Arc<Config>, store: Arc<Store>) {
-    // ── 1. Require the user to be in a voice channel ──────────────────────
+    // ── 1. Require a voice channel ────────────────────────────────────────
     let guild_id = match command.guild_id {
         Some(id) => id,
         None => {
@@ -32,11 +32,7 @@ pub async fn run(ctx: &Context, command: &CommandInteraction, cfg: Arc<Config>, 
     let voice_ch_id = ctx
         .cache
         .guild(guild_id)
-        .and_then(|g| {
-            g.voice_states
-                .get(&command.user.id)
-                .and_then(|vs| vs.channel_id)
-        });
+        .and_then(|g| g.voice_states.get(&command.user.id).and_then(|vs| vs.channel_id));
 
     let voice_ch_id = match voice_ch_id {
         Some(id) => id,
@@ -46,10 +42,20 @@ pub async fn run(ctx: &Context, command: &CommandInteraction, cfg: Arc<Config>, 
         }
     };
 
-    // Text channel where the command was run — used for public announcements.
+    // ── 2. Only one session per guild ────────────────────────────────────
+    if store.active_sessions.contains_key(&guild_id) {
+        reply_ephemeral(
+            ctx,
+            command,
+            "A Spotify session is already active in this server. Use `/stop-spotify` first.",
+        )
+        .await;
+        return;
+    }
+
     let text_ch_id = command.channel_id;
 
-    // ── 2. Send ephemeral auth link ───────────────────────────────────────
+    // ── 3. Send ephemeral auth link ──────────────────────────────────────
     let user_id = command.user.id.to_string();
     let auth_url = build_auth_url(&cfg, &user_id);
 
@@ -59,7 +65,7 @@ pub async fn run(ctx: &Context, command: &CommandInteraction, cfg: Arc<Config>, 
     );
     reply_ephemeral(ctx, command, &msg).await;
 
-    // ── 3. Wait for OAuth callback (5-minute timeout) ─────────────────────
+    // ── 4. Wait for OAuth callback (5-minute timeout) ─────────────────────
     let (tx, rx) = oneshot::channel();
     store.pending.insert(user_id.clone(), tx);
 
@@ -77,7 +83,7 @@ pub async fn run(ctx: &Context, command: &CommandInteraction, cfg: Arc<Config>, 
         }
     };
 
-    // ── 4. Show who we're connecting as ──────────────────────────────────
+    // ── 5. Resolve Spotify display name ──────────────────────────────────
     let spotify_name = get_spotify_user(&tokens.access_token)
         .await
         .unwrap_or_else(|_| "Unknown".to_string());
@@ -86,29 +92,29 @@ pub async fn run(ctx: &Context, command: &CommandInteraction, cfg: Arc<Config>, 
     follow_up(
         ctx,
         command,
-        &format!(
-            "✅ Connected as **{spotify_name}**. Joining your voice channel and registering as a Spotify Connect device…"
-        ),
+        &format!("✅ Connected as **{spotify_name}**. Joining your voice channel…"),
     )
     .await;
 
-    // ── 5. Create librespot Spirc device + PcmReader ──────────────────────
+    // ── 6. Create librespot Spirc device + PcmReader ──────────────────────
     let device_name = store.bot_name.read().await.clone();
-    let (spirc, reader, event_channel, jam_url_rx) = match create_connect_device(&device_name, &tokens.access_token).await {
-        Ok(pair) => pair,
-        Err(e) => {
-            error!("Failed to create Spotify Connect device: {e}");
-            follow_up(ctx, command, &format!("❌ Spotify Connect error: {e}")).await;
-            return;
-        }
-    };
+    let (spirc, reader, event_channel, jam_url_rx) =
+        match create_connect_device(&device_name, &tokens.access_token).await {
+            Ok(pair) => pair,
+            Err(e) => {
+                error!("Failed to create Spotify Connect device: {e}");
+                follow_up(ctx, command, &format!("❌ Spotify Connect error: {e}")).await;
+                return;
+            }
+        };
 
-    // ── 6. Join voice channel and hand audio to songbird ─────────────────
+    // ── 7. Join voice channel ────────────────────────────────────────────
     let manager = match songbird::get(ctx).await {
         Some(m) => m,
         None => {
             error!("Songbird not initialised");
             follow_up(ctx, command, "❌ Internal error: voice system not ready.").await;
+            let _ = spirc.shutdown();
             return;
         }
     };
@@ -124,30 +130,39 @@ pub async fn run(ctx: &Context, command: &CommandInteraction, cfg: Arc<Config>, 
     };
 
     let input: Input = RawAdapter::new(reader, 44_100, 2).into();
-
     {
         let mut handler = handler_lock.lock().await;
         handler.play_input(input);
     }
 
-    // Ephemeral confirmation to the user who ran the command
     follow_up(
         ctx,
         command,
-        &format!("✅ Connected as **{spotify_name}**. Select **{device_name}** in Spotify and hit **Start a Jam** — I'll post the invite here!"),
+        &format!(
+            "✅ Connected as **{spotify_name}**. Select **{device_name}** in Spotify — I'll stream audio here!\n\
+             Hit **Start a Jam** in Spotify and I'll post the invite link."
+        ),
     )
     .await;
 
-    // ── 8. Jam URL: post an embed when a Jam is started ──────────────────
-    // We deduplicate by session token so repeated `session_update` events
-    // (USER_JOINED, DISCOVERABILITY_CHANGED, …) don't spam the channel.
+    // ── 8. Register active session (enables /stop-spotify) ───────────────
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    store.active_sessions.insert(
+        guild_id,
+        ActiveSession {
+            text_channel_id: text_ch_id,
+            voice_channel_id: voice_ch_id,
+            shutdown_tx: std::sync::Mutex::new(Some(shutdown_tx)),
+        },
+    );
+
+    // ── 9. Jam URL announcements ─────────────────────────────────────────
     let ctx_jam = ctx.clone();
     let bot_name_jam = device_name.clone();
     tokio::spawn(async move {
         let mut rx = jam_url_rx;
         let mut sent_tokens = std::collections::HashSet::new();
         while let Some(url) = rx.recv().await {
-            // The URL is always `spotify://socialsession/TOKEN` — extract TOKEN.
             let token = url
                 .strip_prefix("spotify://socialsession/")
                 .unwrap_or(&url)
@@ -160,11 +175,7 @@ pub async fn run(ctx: &Context, command: &CommandInteraction, cfg: Arc<Config>, 
 
             info!("Jam session started: {url}");
 
-            // Discord buttons require https:// — open.spotify.com redirects
-            // to the native app when Spotify is installed, so this works on
-            // all platforms without needing the spotify:// deep-link.
             let https_url = format!("https://open.spotify.com/socialsession/{token}");
-
             let embed = CreateEmbed::new()
                 .title("A Jam just started!")
                 .description(format!(
@@ -187,7 +198,7 @@ pub async fn run(ctx: &Context, command: &CommandInteraction, cfg: Arc<Config>, 
         }
     });
 
-    // ── 9. Now-playing embed + presence update on every track change ───────
+    // ── 10. Now-playing embed + presence on every track change ────────────
     let ctx_np = ctx.clone();
     let device_name_np = device_name.clone();
     tokio::spawn(async move {
@@ -195,7 +206,6 @@ pub async fn run(ctx: &Context, command: &CommandInteraction, cfg: Arc<Config>, 
         while let Some(event) = events.recv().await {
             match event {
                 PlayerEvent::TrackChanged { audio_item } => {
-                    // ── Extract metadata ──────────────────────────────────
                     let track = audio_item.name.clone();
 
                     let (artist, album) = match &audio_item.unique_fields {
@@ -212,7 +222,6 @@ pub async fn run(ctx: &Context, command: &CommandInteraction, cfg: Arc<Config>, 
                         }
                     };
 
-                    // Largest cover image available
                     let cover_url = audio_item
                         .covers
                         .iter()
@@ -220,35 +229,26 @@ pub async fn run(ctx: &Context, command: &CommandInteraction, cfg: Arc<Config>, 
                         .map(|c| c.url.clone())
                         .unwrap_or_default();
 
-                    // spotify:track:ID → https://open.spotify.com/track/ID
                     let spotify_url = audio_item
                         .uri
                         .strip_prefix("spotify:")
-                        .map(|rest| {
-                            format!("https://open.spotify.com/{}", rest.replacen(':', "/", 1))
-                        })
+                        .map(|rest| format!("https://open.spotify.com/{}", rest.replacen(':', "/", 1)))
                         .unwrap_or_default();
 
-                    // mm:ss duration
                     let duration = {
                         let total = audio_item.duration_ms / 1000;
                         format!("{}:{:02}", total / 60, total % 60)
                     };
 
                     let explicit_tag = if audio_item.is_explicit { " 🅴" } else { "" };
-
                     let status = format!("{track} · {artist}");
                     info!("Now playing: {status}");
 
-                    // ── Discord presence ──────────────────────────────────
                     ctx_np.set_presence(
                         Some(ActivityData::listening(&status)),
                         OnlineStatus::Online,
                     );
 
-                    // Album search link —  open.spotify.com/search/{album}
-                    // UniqueFields only carries the album name, not its ID,
-                    // so a search URL is the best we can do without an extra API call.
                     let album_url = if !album.is_empty() {
                         let mut u = url::Url::parse("https://open.spotify.com/search/").unwrap();
                         u.path_segments_mut().unwrap().push(&album);
@@ -257,11 +257,10 @@ pub async fn run(ctx: &Context, command: &CommandInteraction, cfg: Arc<Config>, 
                         String::new()
                     };
 
-                    // ── Now-playing embed ─────────────────────────────────
                     let mut embed = CreateEmbed::new()
                         .author(CreateEmbedAuthor::new(&artist))
                         .title(format!("{track}{explicit_tag}"))
-                        .color(Color::from_rgb(30, 215, 96)) // Spotify green
+                        .color(Color::from_rgb(30, 215, 96))
                         .footer(CreateEmbedFooter::new(format!(
                             "🎧 {device_name_np}  ·  {duration}"
                         )));
@@ -294,29 +293,42 @@ pub async fn run(ctx: &Context, command: &CommandInteraction, cfg: Arc<Config>, 
         ctx_np.set_presence(None, OnlineStatus::Online);
     });
 
-    // ── 10. Watcher: clean up when the voice channel empties ──────────────
+    // ── 11. Session watchdog: clean up on channel empty OR /stop-spotify ──
     let ctx2 = ctx.clone();
+    let store2 = store.clone();
     tokio::spawn(async move {
+        let mut shutdown_rx = shutdown_rx;
         loop {
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            let still_connected = ctx2
-                .cache
-                .guild(guild_id)
-                .map(|g| {
-                    g.voice_states.values().any(|vs| {
-                        vs.channel_id == Some(voice_ch_id)
-                            && vs.user_id != ctx2.cache.current_user().id
-                    })
-                })
-                .unwrap_or(false);
+            tokio::select! {
+                // External shutdown request from /stop-spotify
+                _ = &mut shutdown_rx => {
+                    info!("Spotify session shut down by /stop-spotify command");
+                    break;
+                }
+                // Poll every 5 s for an empty voice channel
+                _ = tokio::time::sleep(Duration::from_secs(5)) => {
+                    let still_connected = ctx2
+                        .cache
+                        .guild(guild_id)
+                        .map(|g| {
+                            g.voice_states.values().any(|vs| {
+                                vs.channel_id == Some(voice_ch_id)
+                                    && vs.user_id != ctx2.cache.current_user().id
+                            })
+                        })
+                        .unwrap_or(false);
 
-            if !still_connected {
-                info!("Voice channel empty — shutting down Spotify Connect device");
-                let _ = spirc.shutdown();
-                let _ = manager.leave(guild_id).await;
-                break;
+                    if !still_connected {
+                        info!("Voice channel empty — shutting down Spotify Connect device");
+                        break;
+                    }
+                }
             }
         }
+
+        let _ = spirc.shutdown();
+        let _ = manager.leave(guild_id).await;
+        store2.active_sessions.remove(&guild_id);
     });
 }
 
